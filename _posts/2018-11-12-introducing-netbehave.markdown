@@ -6,7 +6,7 @@ categories: netbehave
 ---
 I'm happy to announce the official release of the NetBehave that I presented at the BSides Ottawa 2018 conference on November 8th, 2018 in, obviously, Ottawa, Canada.
 
-The code for the system is now live. You can get a copy of the presentation of the [here][[netbehave-bsidesottawa2018-slides] .
+The code for the system is now live. You can get a copy of the presentation [here][netbehave-bsidesottawa2018-slides].
 
 
 **Getting started**
