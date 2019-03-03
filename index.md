@@ -12,5 +12,5 @@ NetBehave is now live!
 <br>
 <br>
 
-More documentation will be coming in the next few weeks.
+<!-- More documentation will be coming in the next few weeks.-->
 <hr>

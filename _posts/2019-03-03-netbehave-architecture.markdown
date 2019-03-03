@@ -1,0 +1,67 @@
+---
+layout: post
+title:  "NetBehave - the story - architecture"
+date:   2019-03-03 14:30:00 -0500
+categories: netbehave
+---
+Summer 2018, in hiatus between projects I got working on taking these to the next level.
+
+I leveraged the experience of the 2 past years to create a full fledge app.
+
+Based on more than 20 years building software, and over 15 in information security, and over 2 years of thinking on and off about the Netflow analysis approach, I used the following principles to guide me in my design:
+Built on the Unix philosophy: make each program do one thing well; this would also allow me to create building blocks for different use cases;
+Minimize attack surface - what threat modeling calls trust boundaries;
+Build iteratively with continuous testing (individual/manual CI/CD): whether you call it agile, don’t wait til the end to make sure all is working well (and my initial not completely defined requirements called for an “agile” methodology anyways).
+
+I had been wanting to learn Docker for some time, but either lacked time or a good project for that purpose. This seemed like the right time to get back to it. Docker containers are basically application level virtualisation. It allows for better process isolation than running regular processes, but is not considered full segmentation. This allows to create “blocks”, meating one of my first goals. Blocks were also provided by the Fluentd plugins. These “blocks” are the core plumbing that I can use to tailor to different business needs (aka  make the system extensible). It can allow us to create various “solutions” from the existing building blocks, as well as by creating other custom blocks as needed. 
+
+As I was building simple building blocks, I went for docker-compose, the simple way to create a fixed set combination of docker containers. 
+
+Docker is often used with other technologies such as Docker Swarm and Kubernetes. Those 2 technologies are used for dynamically start containers based on rules. 
+
+Kubernetes, docker swarm and other technologies would be other options but were beyond the needs of this version (but could be required for larger organisations).
+
+![NetBehave docker instances]({{ site.baseurl }}/img/netbehave-docker-instances.png "NetBehave docker instances")
+
+## Collecting NetFlow/IPFix
+
+NetFlow/IPFix runs on UDP, which means that packets can be lost, moreso over long distances and/or with traffic spikes (flows will also be delayed a few minutes, but are near real-time). So it made sense to split the collector of NetFlow/IPFix into it its own container. This would allow us to have multiple collectors in different locations. In previous versions, I had complex fluentd configuration including copies of messages due to different field in different NetFlow/IPFix versions and templates. So I decide to create another plugin to normalize the information into a “flow” object. As I was testing the system on my home network using flows from my trusty Ubiquiti Edge RouterX, I also found another issue. I saw a lot of flow coming from an external IP hitting my external interface (NATed traffic). That information was not very useful, so I create yet another plugin to DeNat by keeping a list of outgoing connections from my internal network. The last plugin used in the container is a standard Fluentd plugin that forward traffic. Note, this is one for internal (trusted) networks as no encryption is performed; a secure forward plugin exists.
+
+Now I created what I called the core that received using the standard Fluentd forward input. Now I had a flow of normalized traffic, but ip addresses are not that useful by themselves. The beauty of tools such as Fluentd (which I describe as the Unix/Linux command line on steroids in JSON) is that it allows for easy modification of objects through the plugin system. So I decided that I wanted to add domain names from the DNS to the feed. Initial tests trying to do reverse lookups of the IP address had a huge performance impact. So I went about it in another way.
+
+I decide that I would create my own internal DNS server (I was running it on my own network) to save the IP address/domain name pair that would be returned to the internal system. Dnsmasq worked well for this and provided great logs. It would obviously run in its own container (the DNS server). But it had one flaw, it uses unencrypted dns (udp and tcp) that can be eavesdropped, and even potentially modified on its way to other dns servers. So I looked at other options. I found that unbound works well for my needs, but the logs it provided were not detailed enough for me to parse. So I decide to combine both, and have dnsmasq forward requests to unbound (in its own container, DNS Server TLS) which would go outside gather the required information.
+
+The dnsmasq logs were written to a shared folder of the app, and read by another Fluentd-based container: DNS Log Parser. This one consisted of a standard tail input plugin, a new filter plugin to parse the logs and transform that into messages the different log events (query, reply, cached). Then I created an output plugin to send that information into some form of a cache. 
+
+## The DNS cache
+
+While I had used MySql in the past, I wanted to keep the information in each container for this version. I had been using SQLite in other projects (such as the software I used to manage versions of my book) so I decided this would do the trick. But the DNS cache would need some form of security model and user roles. I opted for having no “authentication” per se, but using 3 different ports for different roles (read-only, read-write, admin), and restricting access to those ports instead (through exposing ports in docker). Since all fluentd plugins are written in Ruby, I opted to keep using that same programming language. I ended making that basic server with roles a class that I could reuse (which I did for the IPAM module). The cache uses a “least recently used” model that I capped at 1024 items, but that number is a parameter. Once it reaches the max size, it removes at least ¼ of all items. The DNS Log Parser connects to the read-write port, while a plugin in the core container (reverse DNS filter plugin) connects to the read-only port.
+
+An alternative to a DNS cache?
+In some cases I was not getting DNS responses. And reverse DNS was not efficient. So I went back to one of my “blackbox” pentesting approach: using Arin (.net). American Registry for Internet Numbers (ARIN) is a registry of IP blocks to registered organisations of Canada, the United States, and many Caribbean and North Atlantic islands. It does not include everything (Latam, Asia/Pacific, Europe), but it covers the largest blocks of addresses. Since it has an API, you can retrieve through its whois method. That information gets added to the “arin” sub-object of each relevant src/dst field of the flow object. That information is also cached in another SQLite database.
+
+## IPAM
+
+IPAM stands for IP Address Manager, in this case that is basically a database of IP addresses found (within a defined internal network). As with the DNS cache, we have 3 different ports for different roles (read-only, read-write, admin). This container needed a database, so I used another SQLite one (asset.db). When a new IP address is added, a line is added to a JSON log file called ipam.new. We could also easily add a log file for changes in MAC address if we had such a need. The ipam.new file is shared with yet another Fluentd container (Alerting) which reads the file and sends an email (another standard Fluentd plugin) to notify a new IP address was found. Other alerting methods are possible through existing or new plugins.
+
+## Back to the core
+
+A IPAM output plugin connects to the IPAM read-write port to update when a new IP is found (a temporary cache is used to prevent too many calls for performance reasons). I also added a filter plugin to add service information (protocol/port, which you can generally find in /etc/services on Linux/Unix systems). In my first version, I had created an ACL matching plugin, so I decide to create another filter plugin to match an acl. I used a csv local csv file for simplicity (and time reason) but that could easily be modified. The rules (one per line) include a name (that will be added to the rule once a match if found) and a series of field name, operator (=,!=,<,>) and value (which can include wildcards at the beginning and/or end). The fields are must all match (AND operation between all field matches). The search stops once a match is found, thus rules should be in the order from most specific to generic. The easiest output was the using the standard Fluentd file output plugin. But I wanted to easily be able to query that data. So I created another output plugin using SQLite has the output format. But I wanted to ensure the file sizes did not get too out of hand, I so opted to make it a daily database file (thus was born the out dailydb plugin). But what if you wanted to search in more real-time? Well I guess you would need some sort of a search plugin… You could use the same ACL matching code from earlier, but how do you get that to a user? That’s where we’re heading nexT
+
+## The web interface
+I wanted a simple interface to provide easier access to the system. I used the httpd server part of Alpine (for size and easiest config), but you could use Apache or nginx. I only used basic authentication and no encryption (I would recommend adding it for production). All web interfaces use static files (html, css, javascript) based on bootstrap, and Ruby-based CGIs. Yep CGIs. Using the read-only port of the IPAM, it was easy to build a simple list of IP assets. The daily DB files are listed in another page which allows to download the file (from previous days, as the file will be opened for writing during the day). This can allow to setup the system at the client and have the client download the file and upload it to us for offline analysis. Now we come to one of the most complex pieces of the system, the Flow Search portion. It is composed of a static page that connects to what I call the “middle” server. This Ruby-based server is a threaded application that opens a pair of connections each time the static page asks for a connection. For the client it creates a websocket connection (a technology similar to TCP sockets within web browsers) and a TCP connection for the core. A file of commands is used to tell the core what to do, from connecting to performing the searches. Once the browser connects a open command (with the port number) is written to the instruction file read by the core search output plugin. The browser can send request for an ACL match to the websockets, which gets written to the instruction file, and the search plugin returns the matching values through the TCP socket, which are funnelled to the browser via the websocket.
+
+So now we have an initial set of 9 containers, 4 Fluentd-based, 2 Ruby-based TCP servers, 2 regular Linux applications, and a web server with simple Ruby CGIs and a intermediary server. The containers are bound together using docker-compose, with some shared file systems for logs and data. But how do we get logs properly managed, within this environment. The solution I found for this (and other things)  is [S6][s6-website].
+
+## The container architecture
+
+You may or may not have heard of Dan J. Bernstein (DJB), the famed Chicago professor. He proposed the famous elliptic curve called [Curve25519][Curve25519-wikipedia]. He his the author of qmail and tinydns. Qmail used a subsystem called daemon tools that allowed for process supervision. s6 is a process supervision suite much in that line that provides run script support (for starting processes - for example httpd and the ruby middle.rb server in my web container). It also provides support for changing permissions prior to starting, and  to do logging and log rotation capturing the stdout standard output. I also found people who were using it within docker containers. 
+
+Since supply chain management (managing the risk of the subcomponents you do not control, and there will always be some) was a concern, I decided I would leverage docker creation examples found online, but would repackage them myself. When docker builds an image, it creates layers for most commands it runs in its build process. So I decided that I would try to limit the number of individual layers and have all my containers derive from as few as possible. Alpine Linux is the most commonly used Linux distro for docker. It allows for some of the smallest image. So my base image for all containers (called netbehave-docker-base) was Alpine with the s6. This image is never instantiated, but is referenced by other images. From this image, I derive all the non-Fluend containers. For Fluend containers, a contained another subimage (netbehave-docker-fluentd) that is similar to the base image, but had to be separate since integrating Alpine, s6 and Fluentd gave me headaches. Most custom-written plugins used in the subcontainers are copied in that base image. Each docker image I created copies the rootfs folder to /, simplifying my edits of files including configs, code, and scripts.
+
+![NetBehave detailed components]({{ site.baseurl }}/img/netbehave-components.png "NetBehave detailed components")
+
+[Curve25519-wikipedia]:https://en.wikipedia.org/wiki/Curve25519 
+[s6-website]: https://skarnet.org/software/s6/
+
+
